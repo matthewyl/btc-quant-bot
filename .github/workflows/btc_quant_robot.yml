@@ -32,10 +32,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install requests pandas numpy lightgbm scikit-learn
 
-    # 4. 執行量化模型預測腳本
+    # 4. 執行全新乾淨的量化模型預測腳本 (金蟬脫殼，徹底繞過舊快取)
     - name: Execute Model Prediction
       run: |
-        python main_predict.py
+        python robot.py
 
     # 5. 自動把每天下午更新的 historical_greeks.csv 保存並提交回你的 GitHub (自適應數據庫記憶)
     - name: Commit and Push Historical Data
