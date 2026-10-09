@@ -26,7 +26,7 @@ def fetch_live_proxy_pool():
         ips = re.findall(r'\d+\.\d+\.\d+\.\d+:\d+', res.text)
         if ips:
             print(f"成功捕獲 {len(ips)} 個潛在代理節點，正在提取最優線路...")
-            return ips[0]  # 🟢 修正：精確提取第一個有效的 IP 字串
+            return ips[0]  # 精確提取第一個有效的 IP 字串
     except Exception as e:
         print(f"⚠️ 獲取即時代理池失敗: {e}")
     return None
@@ -38,8 +38,8 @@ def fetch_strict_greeks_data():
     
     proxy_ip = fetch_live_proxy_pool()
     
-    # 🟢 終極修正：修正了原本錯誤的字典語法（Dictionary Syntax Error Fixed）
-    proxies = {"http": f"http://{proxy_ip}", "https://http://{proxy_ip}"} if proxy_ip else None
+    # 🟢 終極修正：將 "https://http://" 修正為正確的單一代理網址字串
+    proxies = {"http": f"http://{proxy_ip}", "https": f"http://{proxy_ip}"} if proxy_ip else None
     
     if proxies:
         print(f"🚀 【隧道架設成功】正在使用住宅代理線路 [{proxy_ip}] 穿透交易所防線...")
@@ -48,11 +48,9 @@ def fetch_strict_greeks_data():
 
     try:
         response = requests.get(url, headers=headers, proxies=proxies, timeout=15)
-        # 檢查是否拿到了真正的 JSON
         res_json = response.json()
     except Exception as e:
         print(f"⚠️ 第一代理線路擁堵 ({e})，正在自動切換至第二高匿名防線...")
-        # 備用防線：如果第一個代理被佔用，直接啟用高穿透的公共鏡像流
         backup_url = "https://githubusercontent.com"
         response = requests.get(backup_url, headers=headers, timeout=15)
         res_json = response.json()
@@ -67,7 +65,7 @@ def fetch_strict_greeks_data():
         parts = name.split('-')
         if len(parts) == 4:
             options_list.append({
-                'name': name, 'type': parts,
+                'name': name, 'type': parts[1],
                 'volume': float(item.get('volume', item.get('v', 0))),
                 'open_interest': float(item.get('open_interest', item.get('oi', 0))),
                 'bid_iv': float(item.get('bid_iv', 0)), 'ask_iv': float(item.get('ask_iv', 0)),
