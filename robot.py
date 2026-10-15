@@ -3,18 +3,19 @@ import pandas as pd
 import numpy as np
 import os
 from datetime import datetime, timezone
-from math import log, sqrt, exp
-from scipy.stats import norm  # GitHub Actions 已有 scipy（經 scikit-learn）
+from zoneinfo import ZoneInfo
+from math import log, sqrt
+from scipy.stats import norm
 
 HISTORY_FILE = "historical_greeks.csv"
 
-# ====================== Telegram ======================
+# ====================== Telegram 推播 ======================
 def send_telegram_notification(message: str):
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not bot_token or not chat_id:
-        print("⚠️ 缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID（請設定 GitHub Secrets）")
+        print("⚠️ 缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID（請至 GitHub Secrets 檢查）")
         return
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -34,24 +35,34 @@ def send_telegram_notification(message: str):
         print(f"⚠️ Telegram 發送錯誤: {e}")
 
 
-# ====================== 簡易 Black-Scholes Delta ======================
-def bs_delta(S, K, T, r, sigma, option_type="C"):
-    """簡易 BS delta（r=0 對 crypto 足夠）"""
+# ====================== 期權定價核心 (BS 模型) ======================
+def bs_delta(S: float, K: float, T: float, r: float, sigma: float, option_type: str = "C") -> float:
+    """計算標準 BS Delta（r 預設 0）"""
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
     try:
-        d1 = (log(S / K) + (0.5 * sigma**2) * T) / (sigma * sqrt(T))
+        d1 = (log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt(T))
         if option_type == "C":
-            return norm.cdf(d1)
+            return float(norm.cdf(d1))
         else:
-            return norm.cdf(d1) - 1.0
+            return float(norm.cdf(d1) - 1.0)
     except Exception:
         return 0.0
 
 
-# ====================== 真正 Deribit 數據 ======================
-def fetch_deribit_options():
-    """取得 BTC 所有未到期 options 的 book summary"""
+def bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """計算標準 BS Gamma"""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    try:
+        d1 = (log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt(T))
+        return float(norm.pdf(d1) / (S * sigma * sqrt(T)))
+    except Exception:
+        return 0.0
+
+
+# ====================== 爬取與清洗 Deribit 數據 ======================
+def fetch_deribit_options() -> pd.DataFrame:
     url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency"
     params = {"currency": "BTC", "kind": "option"}
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -61,107 +72,129 @@ def fetch_deribit_options():
         r.raise_for_status()
         data = r.json().get("result", [])
         if not data:
-            raise ValueError("Empty result from Deribit")
+            raise ValueError("Deribit 返回空數據")
         print(f"✅ 成功取得 {len(data)} 個 BTC options 合約")
         return pd.DataFrame(data)
     except Exception as e:
-        print(f"❌ Deribit API 失敗: {e}")
+        print(f"❌ Deribit API 請求失敗: {e}")
         return None
 
 
 def parse_and_enrich(df: pd.DataFrame):
-    """解析 instrument_name + 計算近似 delta + 過濾"""
     if df is None or df.empty:
-        return None
+        return None, None
 
-    # 解析 BTC-24OCT26-95000-C 格式
+    # 解析合約名稱：BTC-24OCT26-95000-C
     def parse_name(name):
         try:
             parts = name.split("-")
             if len(parts) != 4:
                 return None, None, None, None
-            expiry_str, strike, opt_type = parts[1], float(parts[2]), parts[3]
-            # 轉換到期日
-            expiry = datetime.strptime(expiry_str, "%d%b%y").replace(tzinfo=timezone.utc)
-            return expiry, strike, opt_type, name
+            # Deribit 官方標準每日 08:00 UTC 結算
+            expiry = datetime.strptime(parts[1], "%d%b%y").replace(
+                hour=8, minute=0, second=0, tzinfo=timezone.utc
+            )
+            return expiry, float(parts[2]), parts[3], name
         except Exception:
             return None, None, None, None
 
     parsed = df["instrument_name"].apply(parse_name)
     df[["expiry", "strike", "opt_type", "name"]] = pd.DataFrame(parsed.tolist(), index=df.index)
-
     df = df.dropna(subset=["expiry", "strike", "opt_type"])
-    df = df[df["open_interest"] > 0]  # 只保留有持倉
 
-    # 取得現貨價（用最流動合約的 underlying_price）
-    underlying = df["underlying_price"].median()
+    now = datetime.now(timezone.utc)
+    # 過濾已到期合約與 0 持倉合約
+    df = df[df["expiry"] > now]
+    df = df[df["open_interest"] > 0]
+
+    # 取底層資產現貨價
+    underlying = df["underlying_price"].dropna().median()
     if pd.isna(underlying) or underlying <= 0:
         underlying = df["underlying_price"].iloc[0]
 
-    now = datetime.now(timezone.utc)
-    df["T"] = df["expiry"].apply(lambda x: max((x - now).total_seconds() / (365.25 * 24 * 3600), 1/365.25))
+    # 年化到期時間 T
+    df["T"] = df["expiry"].apply(lambda x: (x - now).total_seconds() / (365.25 * 86400))
+    df["days_to_expiry"] = df["T"] * 365.25
 
-    # 用 mark_iv 計算近似 delta
-    df["mark_iv"] = df["mark_iv"].fillna(df["mark_iv"].median()) / 100.0  # 轉成小數
+    # 隱含波動率換算
+    df["mark_iv"] = df["mark_iv"].fillna(df["mark_iv"].median()) / 100.0
+
+    # 計算 Greeks
     df["delta"] = df.apply(
         lambda row: bs_delta(underlying, row["strike"], row["T"], 0.0, row["mark_iv"], row["opt_type"]),
         axis=1
     )
-
-    # 近似 gamma（簡化）
     df["gamma"] = df.apply(
-        lambda row: norm.pdf(
-            (log(underlying / row["strike"]) + 0.5 * row["mark_iv"]**2 * row["T"]) /
-            (row["mark_iv"] * sqrt(row["T"]))
-        ) / (underlying * row["mark_iv"] * sqrt(row["T"])) if row["T"] > 0 and row["mark_iv"] > 0 else 0.0,
+        lambda row: bs_gamma(underlying, row["strike"], row["T"], 0.0, row["mark_iv"]),
         axis=1
     )
 
     return df, underlying
 
 
+# ====================== 計算量化指標 ======================
 def calculate_metrics(df: pd.DataFrame, underlying: float):
-    """計算核心指標"""
-    calls = df[df["opt_type"] == "C"]
-    puts = df[df["opt_type"] == "P"]
-
-    # 1. OI PCR
-    call_oi = calls["open_interest"].sum()
-    put_oi = puts["open_interest"].sum()
+    # 1. 全市場 OI PCR 與 Volume PCR
+    call_oi = df[df["opt_type"] == "C"]["open_interest"].sum()
+    put_oi = df[df["opt_type"] == "P"]["open_interest"].sum()
     pcr_oi = put_oi / call_oi if call_oi > 0 else 1.0
 
-    # 2. Volume PCR
-    call_vol = calls["volume"].sum()
-    put_vol = puts["volume"].sum()
+    call_vol = df[df["opt_type"] == "C"]["volume"].sum()
+    put_vol = df[df["opt_type"] == "P"]["volume"].sum()
     pcr_vol = put_vol / call_vol if call_vol > 0 else 1.0
 
-    # 3. 25-Delta Skew (Put IV - Call IV)  ← 正數 = put 較貴 = 偏空
-    near_25d_put = puts[(puts["delta"].abs() >= 0.20) & (puts["delta"].abs() <= 0.30)]
-    near_25d_call = calls[(calls["delta"] >= 0.20) & (calls["delta"] <= 0.30)]
-
-    put_iv_25 = near_25d_put["mark_iv"].mean() * 100 if not near_25d_put.empty else np.nan
-    call_iv_25 = near_25d_call["mark_iv"].mean() * 100 if not near_25d_call.empty else np.nan
-
-    if not np.isnan(put_iv_25) and not np.isnan(call_iv_25):
-        skew_25d = put_iv_25 - call_iv_25
+    # 2. 期限結構對齊：選取最接近 7 天（短期核心）的特定到期日
+    now = datetime.now(timezone.utc)
+    unique_expiries = sorted(df["expiry"].unique())
+    
+    # 鎖定 5~14 天內最接近 7 天的到期日，若無則取最近的一個未到期日
+    eligible_expiries = [exp for exp in unique_expiries if (exp - now).total_seconds() >= 2 * 86400]
+    if not eligible_expiries:
+        target_expiry = unique_expiries[0]
     else:
-        # fallback：用較寬的 delta 範圍
-        skew_25d = 0.0
+        target_expiry = min(
+            eligible_expiries,
+            key=lambda exp: abs((exp - now).total_seconds() - 7 * 86400)
+        )
 
-    # 4. Net Delta & Total Gamma（簡化代理）
-    net_delta = df["delta"].mul(df["open_interest"]).sum() / 1000  # 縮放方便閱讀
+    target_df = df[df["expiry"] == target_expiry]
+    target_dte = round((target_expiry - now).total_seconds() / 86400, 1)
+
+    # 3. 目標期限的 25-Delta Skew
+    calls_term = target_df[target_df["opt_type"] == "C"]
+    puts_term = target_df[target_df["opt_type"] == "P"]
+
+    near_25d_put = puts_term[(puts_term["delta"].abs() >= 0.20) & (puts_term["delta"].abs() <= 0.30)]
+    near_25d_call = calls_term[(calls_term["delta"] >= 0.20) & (calls_term["delta"] <= 0.30)]
+
+    put_iv = near_25d_put["mark_iv"].mean() * 100 if not near_25d_put.empty else np.nan
+    call_iv = near_25d_call["mark_iv"].mean() * 100 if not near_25d_call.empty else np.nan
+
+    if not np.isnan(put_iv) and not np.isnan(call_iv):
+        skew_25d = put_iv - call_iv
+    else:
+        # Fallback: 放寬至 0.15 ~ 0.35
+        fallback_puts = puts_term[(puts_term["delta"].abs() >= 0.15) & (puts_term["delta"].abs() <= 0.35)]
+        fallback_calls = calls_term[(calls_term["delta"] >= 0.15) & (calls_term["delta"] <= 0.35)]
+        p_iv = fallback_puts["mark_iv"].mean() * 100 if not fallback_puts.empty else np.nan
+        c_iv = fallback_calls["mark_iv"].mean() * 100 if not fallback_calls.empty else np.nan
+        skew_25d = (p_iv - c_iv) if (not np.isnan(p_iv) and not np.isnan(c_iv)) else 0.0
+
+    # 4. 目標期限 ATM IV (行權價 ±2%)
+    atm_term = target_df[target_df["strike"].between(underlying * 0.98, underlying * 1.02)]
+    atm_iv = atm_term["mark_iv"].mean() * 100 if not atm_term.empty else np.nan
+
+    # 5. 全市場未平倉 Delta 與總 Gamma 代理
+    net_delta = df["delta"].mul(df["open_interest"]).sum() / 1000
     total_gamma = df["gamma"].mul(df["open_interest"]).sum()
-
-    # 5. ATM IV（參考）
-    atm = df[df["strike"].between(underlying * 0.98, underlying * 1.02)]
-    atm_iv = atm["mark_iv"].mean() * 100 if not atm.empty else np.nan
 
     return {
         "skew_25d": round(skew_25d, 2),
+        "target_dte": target_dte,
         "pcr_oi": round(pcr_oi, 3),
         "pcr_vol": round(pcr_vol, 3),
         "net_delta": round(net_delta, 2),
-        "total_gamma": round(total_gamma, 6),
+        "total_gamma": round(total_gamma, 5),
         "atm_iv": round(atm_iv, 1) if not np.isnan(atm_iv) else None,
         "underlying": round(underlying, 1),
         "call_oi": int(call_oi),
@@ -169,8 +202,8 @@ def calculate_metrics(df: pd.DataFrame, underlying: float):
     }
 
 
+# ====================== 歷史存儲與動態分位數 ======================
 def update_history_and_thresholds(metrics: dict):
-    """更新歷史並計算動態閾值"""
     new_row = pd.DataFrame([{
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "skew": metrics["skew_25d"],
@@ -184,7 +217,6 @@ def update_history_and_thresholds(metrics: dict):
             hist = pd.read_csv(HISTORY_FILE)
             hist = pd.concat([hist, new_row], ignore_index=True)
             hist = hist.drop_duplicates(subset=["date"], keep="last")
-            # 只保留最近 60 日
             hist = hist.tail(60)
         except Exception:
             hist = new_row
@@ -193,48 +225,45 @@ def update_history_and_thresholds(metrics: dict):
 
     hist.to_csv(HISTORY_FILE, index=False)
 
-    # 動態閾值（有足夠歷史先用 percentile，否則用合理預設）
     if len(hist) >= 10:
         skew_up = hist["skew"].quantile(0.80)
         skew_low = hist["skew"].quantile(0.20)
         pcr_up = hist["pcr"].quantile(0.75)
         pcr_low = hist["pcr"].quantile(0.25)
     else:
-        skew_up, skew_low = 4.0, -1.5
-        pcr_up, pcr_low = 1.15, 0.75
+        skew_up, skew_low = 3.5, -1.0
+        pcr_up, pcr_low = 1.05, 0.70
 
     return skew_up, skew_low, pcr_up, pcr_low
 
 
+# ====================== 多空信號評估 ======================
 def generate_signal(metrics: dict, skew_up, skew_low, pcr_up, pcr_low):
-    """簡單但有效的規則（可之後再加 ML）"""
     skew = metrics["skew_25d"]
     pcr = metrics["pcr_oi"]
 
-    # 偏空：高 put skew + 高 PCR
+    # 綜合評分：高 Skew (看跌保護貴) 與高 PCR 扣分；低 Skew 與低 PCR 加分
+    # 偏空：Put 溢價高 + PCR 結構沉重
     if skew > skew_up and pcr > pcr_up:
-        up_prob = 32.0
-        signal = "🔴 *強烈偏空*\n高 25Δ Skew + 高 OI PCR → 機構對沖/看跌需求強"
-    # 偏多：低（甚至負）skew + 低 PCR
+        score = 25
+        signal = "🔴 *強烈偏空*\n高 25Δ Skew 與高 OI PCR 同步共振，市場避險需求強烈。"
     elif skew < skew_low and pcr < pcr_low:
-        up_prob = 68.0
-        signal = "🟢 *強烈偏多*\n低 Skew + 低 PCR → 市場願意買 call / 少對沖"
-    # 中性偏空
-    elif skew > 2.5 or pcr > 1.1:
-        up_prob = 42.0
-        signal = "🟠 *輕微偏空*\nSkew 或 PCR 偏高，謹慎"
-    # 中性偏多
-    elif skew < 0.5 and pcr < 0.85:
-        up_prob = 58.0
-        signal = "🟢 *輕微偏多*\n籌碼面相對樂觀"
+        score = 80
+        signal = "🟢 *強烈偏多*\n低 Skew（Call 買盤強）疊加低 PCR，多頭持倉佔據主導。"
+    elif skew > 2.0 and pcr > 0.9:
+        score = 40
+        signal = "🟠 *輕微偏空*\nPut 避險情緒偏濃，上方承壓。"
+    elif skew < 0.5 and pcr < 0.75:
+        score = 65
+        signal = "🟢 *輕微偏多*\n市場下行對沖意願較低，籌碼面結構良好。"
     else:
-        up_prob = 50.0
-        signal = "🟡 *中性觀望*\n指標處於常態區間，建議空倉或輕倉"
+        score = 50
+        signal = "🟡 *中性盤整*\n期權隱含情緒處於中樞區間，無明顯單邊方向引導。"
 
-    return up_prob, signal
+    return score, signal
 
 
-# ====================== Main ======================
+# ====================== 主程式 ======================
 if __name__ == "__main__":
     try:
         raw = fetch_deribit_options()
@@ -243,28 +272,29 @@ if __name__ == "__main__":
 
         df, underlying = parse_and_enrich(raw)
         if df is None or df.empty:
-            raise ValueError("解析後無有效合約")
+            raise ValueError("合約解析後為空")
 
         metrics = calculate_metrics(df, underlying)
         skew_up, skew_low, pcr_up, pcr_low = update_history_and_thresholds(metrics)
-        up_prob, signal = generate_signal(metrics, skew_up, skew_low, pcr_up, pcr_low)
+        score, signal = generate_signal(metrics, skew_up, skew_low, pcr_up, pcr_low)
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M") + " HKT"
+        # 鎖定香港時間輸出
+        now_hkt = datetime.now(ZoneInfo("Asia/Hong_Kong")).strftime("%Y-%m-%d %H:%M") + " HKT"
 
         msg = (
             f"🔮 *BTC Options Quant Report*\n"
-            f"📅 {now_str}\n"
+            f"📅 {now_hkt}\n"
             f"-----------------------------------------\n"
             f"💰 *現貨價:* `${metrics['underlying']:,.0f}`\n"
-            f"📊 *25Δ Skew (Put−Call):* `{metrics['skew_25d']:+.2f}` vol\n"
+            f"📊 *25Δ Skew ({metrics['target_dte']}D 到期):* `{metrics['skew_25d']:+.2f}` vol\n"
             f"   (動態區間: `{skew_low:.1f}` ~ `{skew_up:.1f}`)\n"
             f"📈 *OI PCR:* `{metrics['pcr_oi']:.3f}`  (Vol PCR: `{metrics['pcr_vol']:.3f}`)\n"
             f"📉 *Net Delta (代理):* `{metrics['net_delta']:.1f}`\n"
             f"⚡ *Total Gamma (代理):* `{metrics['total_gamma']:.5f}`\n"
-            f"📉 *ATM IV:* `{metrics['atm_iv']}%`\n"
+            f"📉 *ATM IV ({metrics['target_dte']}D):* `{metrics['atm_iv']}%`\n"
             f"📦 *Call OI / Put OI:* `{metrics['call_oi']:,}` / `{metrics['put_oi']:,}`\n"
             f"-----------------------------------------\n"
-            f"🧠 *未來 7 天上行概率（規則版）:* `{up_prob}%`\n\n"
+            f"🧠 *短期多空評分:* `{score} / 100`\n\n"
             f"⚙️ *執行建議:*\n{signal}\n"
             f"-----------------------------------------"
         )
