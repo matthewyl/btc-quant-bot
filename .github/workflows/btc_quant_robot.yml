@@ -1,38 +1,33 @@
 name: BTC Options Quant Predictor
 
-# 定時觸發 + 手動觸發
 on:
   schedule:
-    # 每天 UTC 08:15 = 香港時間 16:15
+    # 每天 UTC 08:15 = 香港時間 16:15（剛好在 Deribit 08:00 結算後）
     - cron: '15 8 * * *'
-  workflow_dispatch:  # 允許在 GitHub 網頁手動執行
+  workflow_dispatch:  # 支援 GitHub 網頁手動觸發
 
 jobs:
   run-predict-model:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 允許自動 commit historical_greeks.csv
+      contents: write   # 允許 commit historical_greeks.csv
 
     steps:
-      # 1. 拉取程式碼
       - name: Checkout Repository Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2. 設定 Python
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # 3. 安裝依賴
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas numpy scipy
 
-      # 4. 執行量化預測（讀取 Secrets）
       - name: Execute Model Prediction
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -40,11 +35,11 @@ jobs:
         run: |
           python robot.py
 
-      # 5. 自動提交更新後的歷史數據
       - name: Commit and Push Historical Data
         run: |
           git config --global user.name "GitHub Quant Bot"
           git config --global user.email "actions@github.com"
+          git pull --rebase origin main || true
           git add historical_greeks.csv || true
           git commit -m "自動更新 Greeks 歷史數據 [skip ci]" || true
           git push origin main || true
